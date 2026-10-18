@@ -1,0 +1,47 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- 版本号：本工具自身的版本（exe 文件属性、图标等会用到） -->
+    <Version>2.4.5.0</Version>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <UseWindowsForms>true</UseWindowsForms>
+    <AssemblyName>LocalCloud</AssemblyName>
+    <RootNamespace>LocalCloud</RootNamespace>
+    <AssemblyTitle>私有云盘</AssemblyTitle>
+    <ApplicationIcon>LocalCloud.ico</ApplicationIcon>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <EnableDefaultItems>true</EnableDefaultItems>
+</PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="QRCoder" Version="1.4.3" />
+    <PackageReference Include="SharpCompress" Version="0.39.0" />
+  </ItemGroup>
+
+  <!-- 将所有依赖资源（web 网页与图标等）一并输出到生成目录 -->
+  <ItemGroup>
+    <None Include="web\**\*" CopyToOutputDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
+    <None Include="LocalCloud.ico" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <!-- ngrok.exe 属于运行依赖，必须随程序部署（始终保持最新版本） -->
+  <ItemGroup>
+    <None Include="config\ngrok.exe" CopyToOutputDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
+  </ItemGroup>
+
+  <!-- config\*.txt 作为出厂默认配置随程序部署。
+       改用 PreserveNewest（替代原先仅 Build 时复制的自定义 Target）：
+       既能作为 MSBuild 项被 publish 一并输出到发布目录，
+       又保证输出目录中运行期已更新的配置不会被项目里的旧文件覆盖 -->
+  <ItemGroup>
+    <None Include="config\*.txt" CopyToOutputDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
+  </ItemGroup>
+
+  <!-- 重要：上面 web / config 这些数据文件必须设置 ExcludeFromSingleFile=true。
+       单文件发布默认会把内容文件一起打包进 exe，而打包进去的文件运行时不会解压到磁盘，
+       程序按 AppDomain.BaseDirectory\config 读取就会找不到 ngrok.exe 等文件 -->
+
+</Project>
