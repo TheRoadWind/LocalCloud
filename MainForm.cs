@@ -102,6 +102,7 @@ namespace LocalCloud
         private TextBox txtPassword;         // 密码输入
         private Button btnSaveAccount;       // 保存账号密码
         private Button btnResetSettings;     // 重置密码
+        private Button btnSecuritySetup;     // 设置密保
         private CheckBox chkShowPassword;    // 显示密码
         private const string AVATAR_FILE = "avatar.png";   // 头像文件名
 
@@ -166,10 +167,149 @@ namespace LocalCloud
 
         // --- 用户设置 ---
         private const string SETTINGS_FILE = "user_settings.txt";
-        private const string DEFAULT_USERNAME = "admin";
-        private const string DEFAULT_PASSWORD = "admin";
-        private const string DEFAULT_NICKNAME = "管理员";
-        private const string RESET_PIN = "2580";
+
+        // 默认凭据：采用「内部方式」加密（XOR 混淆 + Base64），明文不再出现在源码中。
+        // 明文依次为：admin / admin / 管理员 / 2580。运行时经 DecryptCred 还原。
+        private const string DEFAULT_USERNAME_ENC = "LQsOCAI=";
+        private const string DEFAULT_PASSWORD_ENC = "LQsOCAI=";
+        private const string DEFAULT_NICKNAME_ENC = "q8HChvzFif7t";
+        private const string RESET_PIN_ENC = "flpbUQ==";
+
+        // 内部凭据混淆密钥（仅用于避免明文硬编码，非高强度加密）
+        private static readonly byte[] _credKey = System.Text.Encoding.UTF8.GetBytes("LocalCloud#Secure@Key2024");
+
+        /// <summary>内部加密（XOR + Base64，仅做混淆，避免明文硬编码）。</summary>
+        private static string EncryptCred(string plain)
+        {
+            var bytes = System.Text.Encoding.UTF8.GetBytes(plain);
+            for (int i = 0; i < bytes.Length; i++) bytes[i] ^= _credKey[i % _credKey.Length];
+            return Convert.ToBase64String(bytes);
+        }
+
+        /// <summary>内部解密，运行时还原默认凭据明文。</summary>
+        private static string DecryptCred(string cipher)
+        {
+            var bytes = Convert.FromBase64String(cipher);
+            for (int i = 0; i < bytes.Length; i++) bytes[i] ^= _credKey[i % _credKey.Length];
+            return System.Text.Encoding.UTF8.GetString(bytes);
+        }
+
+        // --- 安全设置（找回密码：四位 PIN + 密保问题，加密存储） ---
+        private const string SECURITY_FILE = "security_settings.txt";
+
+        private class SecuritySettings
+        {
+            public bool SetupDone = false;
+            public string Pin = "";                 // 四位找回 PIN（加密存储）
+            public string Question1 = "";
+            public string Answer1 = "";
+            public string Question2 = "";
+            public string Answer2 = "";
+        }
+
+        private int _pinFailCount = 0;                     // PIN 连续验证失败次数
+        private const int PIN_FAIL_LIMIT = 5;              // PIN 最大尝试次数，超过则强制使用密保问题
+        private SecuritySettings _securityCache = null;    // 安全设置内存缓存（运行时文件被删可自动恢复）
+
+        /// <summary>若安全设置文件在运行时被删除，但内存缓存中仍有设置，则自动以密文恢复</summary>
+        private void EnsureSecurityFile()
+        {
+            if (_securityCache == null || !_securityCache.SetupDone) return;
+            string cfgPath = GetConfigPath(SECURITY_FILE);
+            if (!File.Exists(cfgPath))
+            {
+                try
+                {
+                    SaveSecuritySettings(_securityCache);
+                    AddLog("安全设置文件被删除，已从内存缓存自动恢复（密文）");
+                }
+                catch (Exception ex)
+                {
+                    AddLog($"自动恢复安全设置失败: {ex.Message}");
+                }
+            }
+        }
+
+        /// <summary>判断路径是否落在受保护的 config 目录内，或文件名即为安全设置文件</summary>
+        private bool IsProtectedConfigPath(string fullPath)
+        {
+            try
+            {
+                string cfg = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, CONFIG_FOLDER)).TrimEnd('\\') + "\\";
+                string p = Path.GetFullPath(fullPath).TrimEnd('\\') + "\\";
+                if (p.StartsWith(cfg, StringComparison.OrdinalIgnoreCase)) return true;
+                if (Path.GetFileName(fullPath).Equals(SECURITY_FILE, StringComparison.OrdinalIgnoreCase)) return true;
+            }
+            catch { }
+            return false;
+        }
+
+        private SecuritySettings ReadSecuritySettings()
+        {
+            EnsureSecurityFile();
+            var s = new SecuritySettings();
+            try
+            {
+                string cfgPath = GetConfigPath(SECURITY_FILE);
+                if (File.Exists(cfgPath))
+                {
+                    foreach (string raw in File.ReadAllLines(cfgPath, Encoding.UTF8))
+                    {
+                        string line = raw.Trim();
+                        if (line.Length == 0 || !line.Contains("=")) continue;
+                        int idx = line.IndexOf('=');
+                        string key = line.Substring(0, idx).Trim();
+                        string val = line.Substring(idx + 1).Trim();
+                        switch (key)
+                        {
+                            case "SetupDone": s.SetupDone = val == "1"; break;
+                            case "Pin": s.Pin = val.StartsWith("E:") ? DecryptCred(val.Substring(2)) : val; break;
+                            case "Question1": s.Question1 = val.StartsWith("E:") ? DecryptCred(val.Substring(2)) : val; break;
+                            case "Answer1": s.Answer1 = val.StartsWith("E:") ? DecryptCred(val.Substring(2)) : val; break;
+                            case "Question2": s.Question2 = val.StartsWith("E:") ? DecryptCred(val.Substring(2)) : val; break;
+                            case "Answer2": s.Answer2 = val.StartsWith("E:") ? DecryptCred(val.Substring(2)) : val; break;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                AddLog($"读取安全设置失败: {ex.Message}");
+            }
+            _securityCache = s;
+            return s;
+        }
+
+        private void SaveSecuritySettings(SecuritySettings s)
+        {
+            try
+            {
+                string cfgPath = GetConfigPath(SECURITY_FILE);
+                string[] lines = new string[]
+                {
+                    "SetupDone=" + (s.SetupDone ? "1" : "0"),
+                    "Pin=E:" + EncryptCred(s.Pin),
+                    "Question1=E:" + EncryptCred(s.Question1),
+                    "Answer1=E:" + EncryptCred(s.Answer1),
+                    "Question2=E:" + EncryptCred(s.Question2),
+                    "Answer2=E:" + EncryptCred(s.Answer2),
+                };
+                File.WriteAllLines(cfgPath, lines, Encoding.UTF8);
+                _securityCache = s;
+            }
+            catch (Exception ex)
+            {
+                AddLog($"保存安全设置失败: {ex.Message}");
+            }
+        }
+
+        /// <summary>校验密保答案（不区分大小写、忽略首尾空格）</summary>
+        private bool VerifySecurityAnswers(SecuritySettings s, string ans1, string ans2)
+        {
+            if (string.IsNullOrWhiteSpace(s.Answer1) || string.IsNullOrWhiteSpace(s.Answer2)) return false;
+            return string.Equals(s.Answer1.Trim(), (ans1 ?? "").Trim(), StringComparison.OrdinalIgnoreCase)
+                && string.Equals(s.Answer2.Trim(), (ans2 ?? "").Trim(), StringComparison.OrdinalIgnoreCase);
+        }
 
         // --- 传输历史记录（共享页显示） ---
         private readonly object _transferLock = new object();
@@ -327,6 +467,8 @@ namespace LocalCloud
         {
             // 迁移旧版根目录下的配置文件到 config 目录
             MigrateConfigFiles();
+            // 预加载安全设置到内存缓存，便于运行时文件被删后自动恢复（密文写回）
+            ReadSecuritySettings();
 
             this.Text = "私有云盘";
             this.Size = new Size(620, 760);
@@ -368,6 +510,12 @@ namespace LocalCloud
 
             // 加载「我的」页数据（头像、昵称、账号）
             LoadMinePageData();
+
+            // 首次运行：引导设置找回密码信息（重置密码 + 密保问题）
+            if (!File.Exists(GetConfigPath(SECURITY_FILE)))
+            {
+                ShowSecuritySetupForm(true);
+            }
 
             UpdateUIState(false);
 
@@ -686,6 +834,8 @@ namespace LocalCloud
             btnResetSettings.BackColor = Color.FromArgb(255, 82, 82);
             btnResetSettings.ForeColor = Color.White;
             btnResetSettings.Click += BtnResetSettings_Click;
+            btnSecuritySetup = NewButton(page, "", "设置密保", 150, 280, 120);
+            btnSecuritySetup.Click += BtnSecuritySetup_Click;
         }
 
         /// <summary>构建「文件」：共享文件夹浏览器（Win11 风格大图标视图）</summary>
@@ -1670,9 +1820,18 @@ namespace LocalCloud
             return new string(arr);
         }
 
-        /// <summary>重置密码（需电脑 PIN 码，支持随机生成或人工设置）</summary>
+        /// <summary>重置密码：支持「四位PIN码 / 密保问题验证」两种授权方式</summary>
         private void BtnResetSettings_Click(object sender, EventArgs e)
         {
+            SecuritySettings sec = ReadSecuritySettings();
+            if (!sec.SetupDone)
+            {
+                MessageBox.Show("尚未设置找回密码信息，请先设置四位 PIN 码与密保问题。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                ShowSecuritySetupForm(false);
+                sec = ReadSecuritySettings();
+                if (!sec.SetupDone) return;
+            }
+
             using (Form frm = new Form()
             {
                 Text = "重置密码",
@@ -1680,118 +1839,241 @@ namespace LocalCloud
                 FormBorderStyle = FormBorderStyle.FixedDialog,
                 MaximizeBox = false,
                 MinimizeBox = false,
-                ClientSize = new Size(380, 300)
+                ClientSize = new Size(420, 440)
             })
             {
                 int y = 16;
+                frm.Controls.Add(new Label() { Text = "验证方式:", Location = new Point(16, y), AutoSize = true });
+                ComboBox cboMethod = new ComboBox() { Location = new Point(110, y - 3), Width = 260, DropDownStyle = ComboBoxStyle.DropDownList };
+                bool pinLocked = _pinFailCount >= PIN_FAIL_LIMIT;
+                if (!pinLocked) cboMethod.Items.Add("四位PIN码");
+                cboMethod.Items.Add("密保问题验证");
+                cboMethod.SelectedIndex = pinLocked ? cboMethod.Items.Count - 1 : 0;
+                frm.Controls.Add(cboMethod);
+                y += 36;
+                if (pinLocked)
+                {
+                    frm.Controls.Add(new Label() { Text = "PIN 已锁定（连续错误达 " + PIN_FAIL_LIMIT + " 次），请使用密保问题", Location = new Point(16, y), AutoSize = true, ForeColor = Color.Red });
+                    y += 30;
+                }
 
-                // PIN 码
-                Label lblPin = new Label() { Text = "电脑登录 PIN 码:", Location = new Point(20, y), AutoSize = true };
-                frm.Controls.Add(lblPin);
-                TextBox txtPin = new TextBox() { Location = new Point(140, y - 3), Width = 160, UseSystemPasswordChar = true };
-                frm.Controls.Add(txtPin);
-                y += 40;
+                // 四位 PIN 组
+                Panel pPin = new Panel() { Location = new Point(0, y), Size = new Size(420, 40), Visible = false };
+                pPin.Controls.Add(new Label() { Text = "四位PIN码:", Location = new Point(16, 6), AutoSize = true });
+                TextBox txtPin = new TextBox() { Location = new Point(110, 3), Width = 120, UseSystemPasswordChar = true, MaxLength = 4 };
+                txtPin.KeyPress += (s, ev) => { if (!char.IsControl(ev.KeyChar) && !char.IsDigit(ev.KeyChar)) ev.Handled = true; };
+                pPin.Controls.Add(txtPin);
+                frm.Controls.Add(pPin);
+
+                // 密保组
+                Panel pSec = new Panel() { Location = new Point(0, y), Size = new Size(420, 175), Visible = false };
+                Label lblQ1 = new Label() { Location = new Point(16, 6), AutoSize = true };
+                pSec.Controls.Add(lblQ1);
+                TextBox txtA1 = new TextBox() { Location = new Point(16, 34), Width = 360 };
+                pSec.Controls.Add(txtA1);
+                Label lblQ2 = new Label() { Location = new Point(16, 72), AutoSize = true };
+                pSec.Controls.Add(lblQ2);
+                TextBox txtA2 = new TextBox() { Location = new Point(16, 100), Width = 360 };
+                pSec.Controls.Add(txtA2);
+                Button btnSetupSec = new Button() { Text = "修改密保/PIN", Location = new Point(16, 138), Width = 110 };
+                pSec.Controls.Add(btnSetupSec);
+                frm.Controls.Add(pSec);
+
+                int groupsBottom = y + 175;
+                y = groupsBottom + 6;
 
                 // 新密码
-                Label lblNew = new Label() { Text = "新密码:", Location = new Point(20, y), AutoSize = true };
-                frm.Controls.Add(lblNew);
-                TextBox txtNew = new TextBox() { Location = new Point(140, y - 3), Width = 160, UseSystemPasswordChar = true };
+                frm.Controls.Add(new Label() { Text = "新密码:", Location = new Point(16, y), AutoSize = true });
+                TextBox txtNew = new TextBox() { Location = new Point(110, y - 3), Width = 260, UseSystemPasswordChar = true };
                 frm.Controls.Add(txtNew);
-                y += 40;
-
-                // 确认密码
-                Label lblConfirm = new Label() { Text = "确认新密码:", Location = new Point(20, y), AutoSize = true };
-                frm.Controls.Add(lblConfirm);
-                TextBox txtConfirm = new TextBox() { Location = new Point(140, y - 3), Width = 160, UseSystemPasswordChar = true };
+                y += 36;
+                frm.Controls.Add(new Label() { Text = "确认新密码:", Location = new Point(16, y), AutoSize = true });
+                TextBox txtConfirm = new TextBox() { Location = new Point(110, y - 3), Width = 260, UseSystemPasswordChar = true };
                 frm.Controls.Add(txtConfirm);
                 y += 40;
 
-                // 随机生成按钮（仅 PIN 正确时启用）
-                Button btnRandom = new Button() { Text = "随机生成", Location = new Point(140, y - 3), Width = 90, Enabled = false };
+                Button btnRandom = new Button() { Text = "随机生成", Location = new Point(110, y - 3), Width = 100 };
                 frm.Controls.Add(btnRandom);
-                btnRandom.Click += (sender, e) =>
-                {
-                    string pwd = GenerateRandomPassword(10);
-                    txtNew.Text = pwd;
-                    txtConfirm.Text = pwd;
-                };
+                btnRandom.Click += (s, ev) => { string p = GenerateRandomPassword(10); txtNew.Text = p; txtConfirm.Text = p; };
                 y += 44;
 
-                // PIN 实时校验：正确则启用随机生成按钮
-                txtPin.TextChanged += (sender, e) =>
-                {
-                    btnRandom.Enabled = txtPin.Text.Trim() == RESET_PIN;
-                };
-
-                // 显示密码
-                CheckBox chkShow = new CheckBox() { Text = "显示密码", Location = new Point(20, y), AutoSize = true };
+                CheckBox chkShow = new CheckBox() { Text = "显示密码", Location = new Point(16, y), AutoSize = true };
                 frm.Controls.Add(chkShow);
-                chkShow.CheckedChanged += (sender, e) =>
-                {
-                    txtNew.UseSystemPasswordChar = !chkShow.Checked;
-                    txtConfirm.UseSystemPasswordChar = !chkShow.Checked;
-                };
-                y += 36;
+                chkShow.CheckedChanged += (s, ev) => { txtNew.UseSystemPasswordChar = !chkShow.Checked; txtConfirm.UseSystemPasswordChar = !chkShow.Checked; };
+                y += 34;
 
-                // 确定 / 取消
-                Button btnOk = new Button() { Text = "确认重置", Location = new Point(120, y), Width = 100 };
-                Button btnCancel = new Button() { Text = "取消", Location = new Point(230, y), Width = 80 };
+                Button btnOk = new Button() { Text = "确认重置", Location = new Point(140, y), Width = 100 };
+                Button btnCancel = new Button() { Text = "取消", Location = new Point(250, y), Width = 90 };
                 frm.Controls.Add(btnOk);
                 frm.Controls.Add(btnCancel);
-                btnCancel.Click += (sender, e) => frm.DialogResult = DialogResult.Cancel;
+                btnCancel.Click += (s, ev) => frm.DialogResult = DialogResult.Cancel;
 
-                // 确定按钮逻辑
-                string newPassword = "";
-                btnOk.Click += (sender, e) =>
+                Action updateVisible = () =>
                 {
-                    string pin = txtPin.Text.Trim();
-                    if (string.IsNullOrEmpty(pin))
+                    string m = cboMethod.Text;
+                    pPin.Visible = m == "四位PIN码";
+                    pSec.Visible = m == "密保问题验证";
+                    if (m == "密保问题验证")
                     {
-                        MessageBox.Show("请输入电脑登录 PIN 码", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                        return;
+                        lblQ1.Text = "答案1 (" + (sec.Question1.Length > 0 ? sec.Question1 : "未设置") + "):";
+                        lblQ2.Text = "答案2 (" + (sec.Question2.Length > 0 ? sec.Question2 : "未设置") + "):";
                     }
-                    if (pin != RESET_PIN)
+                };
+                cboMethod.SelectedIndexChanged += (s, ev) => updateVisible();
+                btnSetupSec.Click += (s, ev) =>
+                {
+                    ShowSecuritySetupForm(false);
+                    sec = ReadSecuritySettings();
+                    updateVisible();
+                };
+                updateVisible();
+
+                btnOk.Click += (s, ev) =>
+                {
+                    string m = cboMethod.Text;
+                    // 1) 身份校验
+                    if (m == "四位PIN码")
                     {
-                        MessageBox.Show("PIN 码错误", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                        return;
+                        if (txtPin.Text.Trim() != sec.Pin)
+                        {
+                            _pinFailCount++;
+                            AddLog($"PIN 验证失败（桌面端），已连续失败 {_pinFailCount} 次");
+                            if (_pinFailCount >= PIN_FAIL_LIMIT)
+                                MessageBox.Show($"PIN 已连续错误 {PIN_FAIL_LIMIT} 次，已锁定，请改用密保问题验证", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                            else
+                                MessageBox.Show("四位 PIN 码错误", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                            return;
+                        }
                     }
+                    else if (m == "密保问题验证")
+                    {
+                        if (!VerifySecurityAnswers(sec, txtA1.Text, txtA2.Text)) { MessageBox.Show("密保答案错误", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+                    }
+                    else { MessageBox.Show("请选择验证方式", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+
+                    // 2) 新密码校验
                     string pwd = txtNew.Text;
-                    string confirm = txtConfirm.Text;
-                    if (string.IsNullOrEmpty(pwd))
-                    {
-                        MessageBox.Show("请输入新密码，或点击「随机生成」", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                        return;
-                    }
-                    if (pwd.Length < 6)
-                    {
-                        MessageBox.Show("密码长度至少 6 位", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                        return;
-                    }
-                    if (!ValidatePassword(pwd))
-                    {
-                        MessageBox.Show("密码需包含数字、字母、符号中的至少两种", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                        return;
-                    }
-                    if (pwd != confirm)
-                    {
-                        MessageBox.Show("两次输入的密码不一致", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                        return;
-                    }
-                    newPassword = pwd;
+                    if (string.IsNullOrEmpty(pwd)) { MessageBox.Show("请输入新密码，或点击「随机生成」", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
+                    if (pwd.Length < 6) { MessageBox.Show("密码长度至少 6 位", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+                    if (!ValidatePassword(pwd)) { MessageBox.Show("密码需包含数字、字母、符号中的至少两种", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+                    if (pwd != txtConfirm.Text) { MessageBox.Show("两次输入的密码不一致", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+
+                    UserSettings us = ReadUserSettings();
+                    SaveUserSettings(us.Nickname, us.Username, pwd);
+                    txtPassword.Text = "";
+                    LoadMinePageData();
+                    AddLog($"密码已重置: 账号={us.Username}");
+                    MessageBox.Show($"新密码: {pwd}", "密码已重置", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    _pinFailCount = 0;
                     frm.DialogResult = DialogResult.OK;
                 };
 
-                if (frm.ShowDialog(this) == DialogResult.OK)
-                {
-                    UserSettings s = ReadUserSettings();
-                    SaveUserSettings(s.Nickname, s.Username, newPassword);
-                    txtPassword.Text = "";
-                    LoadMinePageData();
-                    AddLog($"密码已重置: 账号={s.Username}");
-                    MessageBox.Show($"新密码: {newPassword}", "密码已重置", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                }
+                frm.ShowDialog(this);
             }
         }
+
+        /// <summary>首次运行 / 手动设置：配置重置密码与密保问题（加密存储到 security_settings.txt）</summary>
+        private void ShowSecuritySetupForm(bool isFirstRun)
+        {
+            using (Form frm = new Form()
+            {
+                Text = isFirstRun ? "首次使用：设置找回密码信息" : "设置密保 / 重置密码",
+                StartPosition = FormStartPosition.CenterParent,
+                FormBorderStyle = FormBorderStyle.FixedDialog,
+                MaximizeBox = false,
+                MinimizeBox = false,
+                ClientSize = new Size(420, 380)
+            })
+            {
+                int y = 16;
+                frm.Controls.Add(new Label() { Text = "为方便后期找回 / 重置密码，请设置以下信息：", Location = new Point(16, y), AutoSize = true });
+                y += 30;
+
+                frm.Controls.Add(new Label() { Text = "四位PIN码(用于找回):", Location = new Point(16, y), AutoSize = true });
+                TextBox txtPwd = new TextBox() { Location = new Point(150, y - 3), Width = 120, UseSystemPasswordChar = true, MaxLength = 4 };
+                frm.Controls.Add(txtPwd);
+                y += 34;
+                frm.Controls.Add(new Label() { Text = "确认PIN码:", Location = new Point(16, y), AutoSize = true });
+                TextBox txtPwd2 = new TextBox() { Location = new Point(150, y - 3), Width = 120, UseSystemPasswordChar = true, MaxLength = 4 };
+                frm.Controls.Add(txtPwd2);
+                y += 40;
+
+                // 限制 PIN 只能输入数字（粘贴的非数字也会被下方正则拦截）
+                KeyPressEventHandler onlyDigits = (s, ev) => { if (!char.IsControl(ev.KeyChar) && !char.IsDigit(ev.KeyChar)) ev.Handled = true; };
+                txtPwd.KeyPress += onlyDigits;
+                txtPwd2.KeyPress += onlyDigits;
+
+                // 密保问题 1（可选模板）
+                frm.Controls.Add(new Label() { Text = "密保问题 1(模板):", Location = new Point(16, y), AutoSize = true });
+                ComboBox cboQ1 = new ComboBox() { Location = new Point(150, y - 3), Width = 240, DropDownStyle = ComboBoxStyle.DropDownList };
+                cboQ1.Items.AddRange(new string[] { "（自定义，下方填写）", "你出生的城市是哪里？", "你第一只宠物的名字是？", "你小学班主任的姓名是？", "你母亲的姓名是？", "你最喜欢的电影是？", "你最好朋友的名字是？" });
+                cboQ1.SelectedIndex = 0;
+                frm.Controls.Add(cboQ1);
+                y += 30;
+                TextBox txtQ1 = new TextBox() { Location = new Point(16, y - 3), Width = 384 };
+                frm.Controls.Add(txtQ1);
+                cboQ1.SelectedIndexChanged += (s, ev) => { if (cboQ1.SelectedIndex > 0) txtQ1.Text = cboQ1.Text; };
+                y += 34;
+                frm.Controls.Add(new Label() { Text = "答案 1:", Location = new Point(16, y), AutoSize = true });
+                TextBox txtA1 = new TextBox() { Location = new Point(150, y - 3), Width = 240 };
+                frm.Controls.Add(txtA1);
+                y += 40;
+
+                // 密保问题 2（可选模板）
+                frm.Controls.Add(new Label() { Text = "密保问题 2(模板):", Location = new Point(16, y), AutoSize = true });
+                ComboBox cboQ2 = new ComboBox() { Location = new Point(150, y - 3), Width = 240, DropDownStyle = ComboBoxStyle.DropDownList };
+                cboQ2.Items.AddRange(new string[] { "（自定义，下方填写）", "你就读的第一所小学叫什么？", "你的第一个手机号后四位？", "你最喜欢的书籍是？", "你父亲的姓名是？", "你的出生年份是？", "你最难忘的旅行地是？" });
+                cboQ2.SelectedIndex = 0;
+                frm.Controls.Add(cboQ2);
+                y += 30;
+                TextBox txtQ2 = new TextBox() { Location = new Point(16, y - 3), Width = 384 };
+                frm.Controls.Add(txtQ2);
+                cboQ2.SelectedIndexChanged += (s, ev) => { if (cboQ2.SelectedIndex > 0) txtQ2.Text = cboQ2.Text; };
+                y += 34;
+                frm.Controls.Add(new Label() { Text = "答案 2:", Location = new Point(16, y), AutoSize = true });
+                TextBox txtA2 = new TextBox() { Location = new Point(150, y - 3), Width = 240 };
+                frm.Controls.Add(txtA2);
+                y += 44;
+
+                Button btnOk = new Button() { Text = "保存", Location = new Point(150, y), Width = 100 };
+                Button btnCancel = new Button() { Text = "取消", Location = new Point(260, y), Width = 90 };
+                frm.Controls.Add(btnOk);
+                frm.Controls.Add(btnCancel);
+                btnCancel.Click += (s, ev) => frm.DialogResult = DialogResult.Cancel;
+
+                btnOk.Click += (s, ev) =>
+                {
+                    string pin = txtPwd.Text;
+                    if (!System.Text.RegularExpressions.Regex.IsMatch(pin, @"^\d{4}$")) { MessageBox.Show("PIN 码必须为 4 位数字", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+                    if (pin != txtPwd2.Text) { MessageBox.Show("两次输入的 PIN 码不一致", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+                    if (string.IsNullOrWhiteSpace(txtQ1.Text) || string.IsNullOrWhiteSpace(txtA1.Text) || string.IsNullOrWhiteSpace(txtQ2.Text) || string.IsNullOrWhiteSpace(txtA2.Text))
+                    { MessageBox.Show("密保问题与答案均不能为空", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+
+                    SecuritySettings sec = new SecuritySettings
+                    {
+                        SetupDone = true,
+                        Pin = pin,
+                        Question1 = txtQ1.Text.Trim(),
+                        Answer1 = txtA1.Text.Trim(),
+                        Question2 = txtQ2.Text.Trim(),
+                        Answer2 = txtA2.Text.Trim(),
+                    };
+                    SaveSecuritySettings(sec);
+                    MessageBox.Show("找回密码信息已保存", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    frm.DialogResult = DialogResult.OK;
+                };
+
+                frm.ShowDialog(this);
+            }
+        }
+
+        /// <summary>「我的」页：设置 / 修改密保与重置密码</summary>
+        private void BtnSecuritySetup_Click(object sender, EventArgs e)
+        {
+            ShowSecuritySetupForm(false);
+        }
+
+
 
         /// <summary>刷新传输记录列表</summary>
         private void RefreshTransferList()
@@ -2430,7 +2712,7 @@ namespace LocalCloud
             try
             {
                 string body;
-                using (StreamReader reader = new StreamReader(req.InputStream, req.ContentEncoding))
+                using (StreamReader reader = new StreamReader(req.InputStream, Encoding.UTF8))
                 {
                     body = reader.ReadToEnd();
                 }
@@ -2489,7 +2771,7 @@ namespace LocalCloud
             try
             {
                 string body;
-                using (StreamReader reader = new StreamReader(req.InputStream, req.ContentEncoding))
+                using (StreamReader reader = new StreamReader(req.InputStream, Encoding.UTF8))
                 {
                     body = reader.ReadToEnd();
                 }
@@ -2564,7 +2846,7 @@ namespace LocalCloud
             try
             {
                 string body;
-                using (StreamReader reader = new StreamReader(req.InputStream, req.ContentEncoding))
+                using (StreamReader reader = new StreamReader(req.InputStream, Encoding.UTF8))
                 {
                     body = reader.ReadToEnd();
                 }
@@ -2598,6 +2880,13 @@ namespace LocalCloud
                     fullPath = Path.Combine(SharedFolderPath, cleanPath);
                 }
                 fullPath = Path.GetFullPath(fullPath);
+
+                // 受保护目录（config）及其中的安全设置文件禁止删除，防止网页端重置
+                if (IsProtectedConfigPath(fullPath))
+                {
+                    SendJsonError(res, "受保护的配置文件，禁止删除", 403);
+                    return;
+                }
 
                 // 防止删除共享目录本身或越界
                 string sharedRoot = Path.GetFullPath(SharedFolderPath).TrimEnd('\\') + "\\";
@@ -2647,7 +2936,7 @@ namespace LocalCloud
             try
             {
                 string body;
-                using (StreamReader reader = new StreamReader(req.InputStream, req.ContentEncoding))
+                using (StreamReader reader = new StreamReader(req.InputStream, Encoding.UTF8))
                 {
                     body = reader.ReadToEnd();
                 }
@@ -2713,7 +3002,7 @@ namespace LocalCloud
             try
             {
                 string body;
-                using (StreamReader reader = new StreamReader(req.InputStream, req.ContentEncoding))
+                using (StreamReader reader = new StreamReader(req.InputStream, Encoding.UTF8))
                 {
                     body = reader.ReadToEnd();
                 }
@@ -2757,7 +3046,7 @@ namespace LocalCloud
             try
             {
                 string body;
-                using (StreamReader reader = new StreamReader(req.InputStream, req.ContentEncoding))
+                using (StreamReader reader = new StreamReader(req.InputStream, Encoding.UTF8))
                 {
                     body = reader.ReadToEnd();
                 }
@@ -3205,7 +3494,7 @@ namespace LocalCloud
             try
             {
                 string body;
-                using (StreamReader reader = new StreamReader(req.InputStream, req.ContentEncoding))
+                using (StreamReader reader = new StreamReader(req.InputStream, Encoding.UTF8))
                 {
                     body = reader.ReadToEnd();
                 }
@@ -3417,9 +3706,9 @@ namespace LocalCloud
         /// <summary>读取用户设置（账号密码、昵称）</summary>
         private UserSettings ReadUserSettings()
         {
-            string nickname = DEFAULT_NICKNAME;
-            string username = DEFAULT_USERNAME;
-            string password = DEFAULT_PASSWORD;
+            string nickname = DecryptCred(DEFAULT_NICKNAME_ENC);
+            string username = DecryptCred(DEFAULT_USERNAME_ENC);
+            string password = DecryptCred(DEFAULT_PASSWORD_ENC);
             try
             {
                 string cfgPath = GetConfigPath(SETTINGS_FILE);
@@ -3430,7 +3719,11 @@ namespace LocalCloud
                     {
                         nickname = parts[0];
                         username = parts[1];
-                        password = parts[2];
+                        string storedPwd = parts[2];
+                        // 密码字段已加密（前缀 E:），旧版明文文件自动兼容
+                        password = storedPwd.StartsWith("E:", StringComparison.Ordinal)
+                            ? DecryptCred(storedPwd.Substring(2))
+                            : storedPwd;
                     }
                 }
             }
@@ -3447,7 +3740,8 @@ namespace LocalCloud
             try
             {
                 string cfgPath = GetConfigPath(SETTINGS_FILE);
-                File.WriteAllText(cfgPath, $"{nickname}|{username}|{password}", Encoding.UTF8);
+                // 密码字段用内部方式加密后以 E:<密文> 形式存储，避免明文落盘
+                File.WriteAllText(cfgPath, $"{nickname}|{username}|E:{EncryptCred(password)}", Encoding.UTF8);
             }
             catch (Exception ex)
             {
@@ -3487,7 +3781,7 @@ namespace LocalCloud
             try
             {
                 string body;
-                using (StreamReader reader = new StreamReader(req.InputStream, req.ContentEncoding))
+                using (StreamReader reader = new StreamReader(req.InputStream, Encoding.UTF8))
                 {
                     body = reader.ReadToEnd();
                 }
@@ -3523,7 +3817,7 @@ namespace LocalCloud
             try
             {
                 string body;
-                using (StreamReader reader = new StreamReader(req.InputStream, req.ContentEncoding))
+                using (StreamReader reader = new StreamReader(req.InputStream, Encoding.UTF8))
                 {
                     body = reader.ReadToEnd();
                 }
@@ -3555,32 +3849,77 @@ namespace LocalCloud
             }
         }
 
-        /// <summary>重置设置（需 PIN 码）</summary>
+        /// <summary>重置设置（验证方式：四位PIN码 / 密保问题）</summary>
         private void HandleSettingsReset(HttpListenerRequest req, HttpListenerResponse res)
         {
             try
             {
                 string body;
-                using (StreamReader reader = new StreamReader(req.InputStream, req.ContentEncoding))
+                using (StreamReader reader = new StreamReader(req.InputStream, Encoding.UTF8))
                 {
                     body = reader.ReadToEnd();
                 }
                 Dictionary<string, string> parameters = ParseFormUrlEncoded(body);
-                string pin = parameters.GetValueOrDefault("pin", "");
+                string method = parameters.GetValueOrDefault("method", "");
 
-                // 重置需要输入电脑 PIN 码，若无法获取则使用默认 2580
-                string expectedPin = RESET_PIN;
-                // 尝试获取 Windows PIN（通过检查是否存在相关机制，这里简化为固定值）
-                if (string.IsNullOrEmpty(pin) || pin != expectedPin)
+                EnsureSecurityFile();
+                SecuritySettings sec = ReadSecuritySettings();
+
+                if (!sec.SetupDone)
                 {
-                    SendJsonError(res, "PIN 码错误", 403);
+                    SendJsonError(res, "尚未设置找回密码信息，请先在客户端设置 PIN 与密保问题", 403);
                     return;
                 }
 
-                // 重置为默认设置
-                SaveUserSettings(DEFAULT_NICKNAME, DEFAULT_USERNAME, DEFAULT_PASSWORD);
-                AddLog("用户设置已重置为默认值");
-                SendJsonResponse(res, "{\"success\":true}", 200);
+                bool authorized = false;
+                if (method == "pin")
+                {
+                    // 达到上限：PIN 入口锁定，强制改用密保问题
+                    if (_pinFailCount >= PIN_FAIL_LIMIT)
+                    {
+                        SendJsonError(res, "PIN 尝试次数过多，请改用密保问题验证", 423);
+                        return;
+                    }
+                    string pin = parameters.GetValueOrDefault("pin", "");
+                    if (sec.SetupDone && pin == sec.Pin)
+                    {
+                        authorized = true;
+                    }
+                    else
+                    {
+                        _pinFailCount++;
+                        AddLog($"PIN 验证失败，已连续失败 {_pinFailCount} 次");
+                        SendJsonError(res, "PIN 码错误", 403);
+                        return;
+                    }
+                }
+                else if (method == "security")
+                {
+                    string ans1 = parameters.GetValueOrDefault("answer1", "");
+                    string ans2 = parameters.GetValueOrDefault("answer2", "");
+                    if (sec.SetupDone && VerifySecurityAnswers(sec, ans1, ans2))
+                    {
+                        authorized = true;
+                    }
+                    else
+                    {
+                        SendJsonError(res, "密保答案错误", 403);
+                        return;
+                    }
+                }
+                else
+                {
+                    SendJsonError(res, "请选择验证方式（pin / security）", 400);
+                    return;
+                }
+
+                if (authorized)
+                {
+                    _pinFailCount = 0; // 验证成功后重置计数
+                    SaveUserSettings(DecryptCred(DEFAULT_NICKNAME_ENC), DecryptCred(DEFAULT_USERNAME_ENC), DecryptCred(DEFAULT_PASSWORD_ENC));
+                    AddLog("用户设置已重置为默认值");
+                    SendJsonResponse(res, "{\"success\":true}", 200);
+                }
             }
             catch (Exception ex)
             {
@@ -3962,6 +4301,12 @@ namespace LocalCloud
                     SendJsonError(res, "目录不存在", 404);
                     return;
                 }
+                // 禁止通过网页浏览受保护的 config 目录
+                if (IsProtectedConfigPath(fullPath))
+                {
+                    SendTextError(res, "受保护目录，禁止访问", 403);
+                    return;
+                }
 
                 List<Dictionary<string, object>> items = new List<Dictionary<string, object>>();
 
@@ -3978,9 +4323,10 @@ namespace LocalCloud
                     items.Add(parentItem);
                 }
 
-                // 子文件夹
+                // 子文件夹（隐藏受保护的 config 目录）
                 foreach (string dir in Directory.GetDirectories(fullPath))
                 {
+                    if (IsProtectedConfigPath(dir)) continue;
                     DirectoryInfo dirInfo = new DirectoryInfo(dir);
                     Dictionary<string, object> item = new Dictionary<string, object>();
                     item["name"] = dirInfo.Name;
@@ -3991,9 +4337,10 @@ namespace LocalCloud
                     items.Add(item);
                 }
 
-                // 文件
+                // 文件（隐藏安全设置文件）
                 foreach (string file in Directory.GetFiles(fullPath))
                 {
+                    if (IsProtectedConfigPath(file)) continue;
                     FileInfo fileInfo = new FileInfo(file);
                     Dictionary<string, object> item = new Dictionary<string, object>();
                     item["name"] = fileInfo.Name;
@@ -4055,6 +4402,12 @@ namespace LocalCloud
                 if (!File.Exists(filePath))
                 {
                     Send404(res);
+                    return;
+                }
+                // 受保护文件禁止下载
+                if (IsProtectedConfigPath(filePath))
+                {
+                    SendJsonError(res, "受保护文件，禁止访问", 403);
                     return;
                 }
                 // 记录下载
@@ -4185,6 +4538,13 @@ namespace LocalCloud
                 string fullPath = Path.Combine(SharedFolderPath, physicalSubPath);
                 fullPath = Path.GetFullPath(fullPath);
                 Console.WriteLine($"[BrowseFolder] 物理路径: '{fullPath}'");
+
+                // 4.5 受保护目录禁止访问
+                if (IsProtectedConfigPath(fullPath))
+                {
+                    SendTextError(res, "禁止访问：受保护目录", 403);
+                    return;
+                }
 
                 // 5. 确保路径在共享文件夹内
                 string sharedFullPath = Path.GetFullPath(SharedFolderPath);

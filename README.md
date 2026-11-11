@@ -1,6 +1,6 @@
-# LocalCloud（原 PrivateCloud，C# 重写版）
+# LocalCloud（C# 版）
 
-> 由 C# 重写的私有云盘 / 文件共享工具，基于原 VB.NET 项目（PrivateCloud）移植。
+> 由 C# 写的私有云盘 / 文件共享工具。
 
 <img src="docs/LocalCloud.png" width="120" alt="应用图标" />
 
@@ -16,7 +16,7 @@ LocalCloud 是一个运行在 Windows 上的局域网 / 外网文件共享工具
 - 内置 ngrok 外网隧道（需自备 ngrok.exe 与 token），可按时间段自动开启 / 关闭；
 - 待机监听模式：程序后台运行，外部设备首次访问时自动唤醒并启动服务。
 
-> 本仓库为 **C# / WinForms** 重写版本；原项目中的 **RelayCore（GameHub 公网中转）** 模块已被移除，所有依赖（网页 `web/`、图标等）直接复用于新项目。
+> 所有依赖（网页 `web/`、图标等）直接复用于新项目。
 
 ## ✨ 特性
 
@@ -57,7 +57,7 @@ dotnet publish LocalCloud.csproj -c Release -r win-x64 -p:PublishSingleFile=true
 产物：
 
 ```
-D:\Program\LocalCloud\
+D:\Program\LocalCloud\    #路径自定义
 ├── LocalCloud.exe     # 单文件可执行（约 112 MB，含 .NET 运行时）
 ├── LocalCloud.ico
 ├── web\               # 前端网页（必须随附在 exe 旁边）
@@ -130,6 +130,37 @@ netsh advfirewall firewall show rule name="VB_FileTransfer_Port_8080"
 netstat -ano | findstr ":8080"
 ```
 
+## 🔐 默认凭据加密
+
+程序内置的默认账号 / 重置 PIN 等敏感默认值，**不再以明文写入源码**，而是在编译期用「内部方式」加密后保存为密文常量，运行时再解密使用。
+
+- **算法**：对每个 UTF-8 字节与内部密钥做 XOR，再做 Base64 编码（仅做混淆，避免明文出现在源码 / 二进制中，**非高强度加密**）；
+- **内部密钥**：`LocalCloud#Secure@Key2024`（源码中的 `_credKey` 字段）；
+- **解密方法**：`DecryptCred(string cipher)`，与 `EncryptCred` 对称。
+
+密文常量（对应明文依次为：`admin` / `admin` / `管理员` / `2580`）：
+
+| 用途 | 密文常量 | 密文值（Base64） |
+| --- | --- | --- |
+| 默认用户名 | `DEFAULT_USERNAME_ENC` | `LQsOCAI=` |
+| 默认密码 | `DEFAULT_PASSWORD_ENC` | `LQsOCAI=` |
+| 默认昵称 | `DEFAULT_NICKNAME_ENC` | `q8HChvzFif7t` |
+| 重置 PIN | `RESET_PIN_ENC` | `flpbUQ==` |
+
+> 如需修改默认凭据，请用同样的 `EncryptCred` 重新生成密文常量替换即可，不要再把这些明文直接写回代码。
+
+落盘文件 `config/user_settings.txt`（格式 `昵称|用户名|密码`）中的**密码字段同样已加密**，以 `E:<密文>` 形式保存；旧版明文文件可自动兼容（无 `E:` 前缀时按明文读取）。
+
+## 🔑 密码重置与密保（找回密码）
+
+忘记 LocalCloud 登录密码时，可在「我的 → 重置密码」或网页端 `/settings/reset` 通过以下任一方式验证身份后重设：
+
+1. **四位 PIN 码（推荐，首次使用需先设置）**：输入你首次设置的 4 位数字 PIN；
+2. **密保问题验证**：正确回答首次设置时填写的 2 道密保问题。
+
+- **首次打开程序**会弹出设置向导，要求同时设置**四位 PIN 码**与 **2 道密保问题（含答案）**，加密后存入 `config/security_settings.txt`（字段均带 `E:` 前缀加密）。之后也可在「我的 → 设置密保」随时修改。
+- ⚠️ **关于「电脑 PIN 码」**：Windows 出于安全设计**不允许应用程序读取**用户的登录 PIN 值，因此本程序不读取系统 PIN，而是由用户自行设定一个**独立的四位找回 PIN**（仅用于找回/重置 LocalCloud 登录密码），与系统登录 PIN 互不相干。
+
 ## 📁 目录结构
 
 ```
@@ -165,18 +196,24 @@ LocalCloud/
 
 > 配置文件（账号密码、头像、传输记录、ngrok 自动监听配置等）运行时统一存放在程序目录的 `config/` 子目录下。
 
-## 📝 与原始项目的差异
-
-- 语言：VB.NET → C#；
-- 移除 `RelayCore`（GameHub 公网中转）相关代码与项目引用；
-- 单实例 / 启动事件逻辑由 `ApplicationEvents.vb` 迁移至 `Program.cs`；
-- 原项目所有注释已保留。
-
 ## 📄 License
 
 本项目基于 MIT 协议开源。
 
 ## 📝 更新日志
+
+### v2.4.7.0 (2026-11-11)
+
+- 找回密码：四位 PIN 连续错误 5 次后锁定，强制改用密保问题验证（客户端/网页端通用，验证成功重置计数）；
+- 网页端保护：config 目录及安全设置文件（security_settings.txt）对网页不可见、不可浏览、不可删除、不可下载，防止被网页端删除/重置；
+- 运行时保护：若安全设置文件在程序运行期间被本地删除，将基于内存缓存自动以密文恢复；
+- 版本号升级。
+
+### v2.4.6.0 (2026-10-30)
+
+- 找回密码：四位 PIN 码输入框限制只能输入数字；
+- 设置密保问题时提供常用问题模板（可一键填入，也可自定义）；
+- 细节优化与版本号升级。
 
 ### v2.4.5.0 (2026-10-19)
 

@@ -1921,24 +1921,43 @@ function changePassword() {
     .catch(function(err) { alert('请求失败: ' + err.message); });
 }
 
-// 重置设置（需电脑 PIN 码）
+// 重置设置（四位 PIN 码或密保问题；PIN 连续错误 5 次后锁定，需密保）
 function resetSettings() {
-    var pin = prompt('请输入电脑登录 PIN 码以重置设置：');
+    var pin = prompt('请输入四位 PIN 码以重置设置（连续错误 5 次将锁定，需密保问题）：');
     if (pin === null) return;
     if (!pin.trim()) { alert('PIN 码不能为空'); return; }
     fetch('/settings/reset', {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: 'pin=' + encodeURIComponent(pin.trim())
+        body: 'method=pin&pin=' + encodeURIComponent(pin.trim())
     })
-    .then(function(r) { return r.json().catch(function() { return {}; }); })
-    .then(function(data) {
-        if (data.success) {
+    .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, status: r.status, data: d }; }).catch(function() { return { ok: r.ok, status: r.status, data: {} }; }); })
+    .then(function(res) {
+        if (res.ok && res.data.success) {
             alert('已重置为默认设置');
             renderMinePage();
-        } else {
-            alert('重置失败: ' + (data.error || '未知错误'));
+            return;
         }
+        var msg = (res.data && res.data.error) || '重置失败';
+        // PIN 被锁定：引导使用密保问题
+        if (res.status === 423 || msg.indexOf('密保') >= 0) {
+            var a1 = prompt('PIN 已锁定，请输入密保问题 1 的答案：');
+            if (a1 === null) return;
+            var a2 = prompt('请输入密保问题 2 的答案：');
+            if (a2 === null) return;
+            fetch('/settings/reset', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: 'method=security&answer1=' + encodeURIComponent(a1.trim()) + '&answer2=' + encodeURIComponent(a2.trim())
+            })
+            .then(function(r2) { return r2.json().catch(function() { return {}; }); })
+            .then(function(d2) {
+                if (d2.success) { alert('已重置为默认设置'); renderMinePage(); }
+                else alert('重置失败: ' + (d2.error || '答案错误'));
+            });
+            return;
+        }
+        alert('重置失败: ' + msg);
     })
     .catch(function(err) { alert('请求失败: ' + err.message); });
 }

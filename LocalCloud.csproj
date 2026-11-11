@@ -2,7 +2,7 @@
 
   <PropertyGroup>
     <!-- 版本号：本工具自身的版本（exe 文件属性、图标等会用到） -->
-    <Version>2.4.5.0</Version>
+    <Version>2.4.7.0</Version>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net10.0-windows</TargetFramework>
     <Nullable>disable</Nullable>
