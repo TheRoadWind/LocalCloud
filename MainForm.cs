@@ -63,6 +63,13 @@ namespace LocalCloud
         private ComboBox cmbLogKeepDays;                     // 日志保留时长下拉框
         private int _logKeepDays = DEFAULT_LOG_KEEP_DAYS;    // 当前保留天数（0 = 长期）
         private bool _logHasUnsavedRequests = false;         // 当前日志是否出现过请求（决定是否落盘保留）
+        private DateTimePicker dtpLogCleanupTime;            // 每日日志清理时间
+        private CheckBox chkSaveLogBeforeAutoClear;          // 自动清理日志框前是否保存日志
+        private System.Timers.Timer _dailyLogTimer;          // 每日日志清理定时器
+        private DateTime _lastDailyLogDate = DateTime.MinValue; // 上次执行每日清理的日期
+        private TimeSpan _logCleanupTime = new TimeSpan(9, 0, 0); // 默认 09:00
+        private bool _saveLogBeforeAutoClear = true;
+        private bool _loadingLogConfig = false;
 
         // --- 底部四标签页 ---
         private TabControl tabMain;
@@ -133,6 +140,7 @@ namespace LocalCloud
         // --- 日志文件保留策略 ---
         private const string LOG_KEEP_CONFIG_FILE = "log_keep_days.txt";
         private const int DEFAULT_LOG_KEEP_DAYS = 30;   // 0 表示长期保留（不清理）
+        private const string LOG_DAILY_CONFIG_FILE = "log_daily_config.txt";
 
         // 判定“日志中是否出现过请求”的关键词（不区分大小写）
         // 注意：不要使用过于宽泛的词，否则会被非请求的日志误命中：
@@ -500,7 +508,9 @@ namespace LocalCloud
             LoadRecentConfig();
             LoadTransferConfig();
             LoadLogKeepConfig();
+            LoadLogDailyConfig();
             CleanupOldLogs();
+            StartDailyLogTimer();
             string autoIp = GetLocalIpAddress();
             txtIp.Text = !string.IsNullOrEmpty(autoIp) ? autoIp : "127.0.0.1";
             txtPort.Text = DefaultPort.ToString();
@@ -714,6 +724,15 @@ namespace LocalCloud
             cmbLogKeepDays.SelectedIndex = LogKeepIndexFromDays(DEFAULT_LOG_KEEP_DAYS);
             page.Controls.Add(cmbLogKeepDays);
             cmbLogKeepDays.SelectedIndexChanged += CmbLogKeepDays_Changed;
+
+            // 每日自动清理日志框（默认 09:00），清理前是否保存日志
+            NewLabel(page, "", "每日清理:", 20, 668);
+            dtpLogCleanupTime = NewDateTimePicker(page, "", 90, 665, 70, "HH:mm");
+            dtpLogCleanupTime.Value = new DateTime(2000, 1, 1, 9, 0, 0);
+            dtpLogCleanupTime.ValueChanged += LogDailyConfig_Changed;
+            chkSaveLogBeforeAutoClear = NewCheckBox(page, "chkSaveLogBeforeAutoClear", "清理前保存", 170, 668);
+            chkSaveLogBeforeAutoClear.Checked = true;
+            chkSaveLogBeforeAutoClear.CheckedChanged += LogDailyConfig_Changed;
         }
 
         /// <summary>构建「共享」：二维码 + 传输记录</summary>
@@ -1922,7 +1941,7 @@ namespace LocalCloud
                 cboMethod.SelectedIndexChanged += (s, ev) => updateVisible();
                 btnSetupSec.Click += (s, ev) =>
                 {
-                    ShowSecuritySetupForm(false);
+                    OpenSecuritySetupForEdit();
                     sec = ReadSecuritySettings();
                     updateVisible();
                 };
@@ -1973,21 +1992,30 @@ namespace LocalCloud
         }
 
         /// <summary>首次运行 / 手动设置：配置重置密码与密保问题（加密存储到 security_settings.txt）</summary>
-        private void ShowSecuritySetupForm(bool isFirstRun)
+        private void ShowSecuritySetupForm(bool isFirstRun, SecuritySettings existing = null)
         {
+            bool isEdit = existing != null && existing.SetupDone;
             using (Form frm = new Form()
             {
-                Text = isFirstRun ? "首次使用：设置找回密码信息" : "设置密保 / 重置密码",
+                Text = isFirstRun ? "首次使用：设置找回密码信息" : (isEdit ? "修改密保 / PIN" : "设置密保 / 重置密码"),
                 StartPosition = FormStartPosition.CenterParent,
                 FormBorderStyle = FormBorderStyle.FixedDialog,
                 MaximizeBox = false,
                 MinimizeBox = false,
-                ClientSize = new Size(420, 380)
+                ClientSize = new Size(420, isEdit ? 420 : 380)
             })
             {
                 int y = 16;
                 frm.Controls.Add(new Label() { Text = "为方便后期找回 / 重置密码，请设置以下信息：", Location = new Point(16, y), AutoSize = true });
                 y += 30;
+
+                CheckBox chkKeepQa = null;
+                if (isEdit)
+                {
+                    chkKeepQa = new CheckBox() { Text = "保留原密保问题与答案（仅修改 PIN）", Location = new Point(16, y), AutoSize = true };
+                    frm.Controls.Add(chkKeepQa);
+                    y += 30;
+                }
 
                 frm.Controls.Add(new Label() { Text = "四位PIN码(用于找回):", Location = new Point(16, y), AutoSize = true });
                 TextBox txtPwd = new TextBox() { Location = new Point(150, y - 3), Width = 120, UseSystemPasswordChar = true, MaxLength = 4 };
@@ -2035,6 +2063,17 @@ namespace LocalCloud
                 frm.Controls.Add(txtA2);
                 y += 44;
 
+                if (chkKeepQa != null)
+                {
+                    Action updateQaEnabled = () =>
+                    {
+                        bool disabled = chkKeepQa.Checked;
+                        cboQ1.Enabled = txtQ1.Enabled = txtA1.Enabled = cboQ2.Enabled = txtQ2.Enabled = txtA2.Enabled = !disabled;
+                    };
+                    chkKeepQa.CheckedChanged += (s, ev) => updateQaEnabled();
+                    updateQaEnabled();
+                }
+
                 Button btnOk = new Button() { Text = "保存", Location = new Point(150, y), Width = 100 };
                 Button btnCancel = new Button() { Text = "取消", Location = new Point(260, y), Width = 90 };
                 frm.Controls.Add(btnOk);
@@ -2046,17 +2085,28 @@ namespace LocalCloud
                     string pin = txtPwd.Text;
                     if (!System.Text.RegularExpressions.Regex.IsMatch(pin, @"^\d{4}$")) { MessageBox.Show("PIN 码必须为 4 位数字", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
                     if (pin != txtPwd2.Text) { MessageBox.Show("两次输入的 PIN 码不一致", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
-                    if (string.IsNullOrWhiteSpace(txtQ1.Text) || string.IsNullOrWhiteSpace(txtA1.Text) || string.IsNullOrWhiteSpace(txtQ2.Text) || string.IsNullOrWhiteSpace(txtA2.Text))
-                    { MessageBox.Show("密保问题与答案均不能为空", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+
+                    bool keepQa = chkKeepQa != null && chkKeepQa.Checked;
+                    string q1, a1, q2, a2;
+                    if (keepQa)
+                    {
+                        q1 = existing.Question1; a1 = existing.Answer1; q2 = existing.Question2; a2 = existing.Answer2;
+                    }
+                    else
+                    {
+                        if (string.IsNullOrWhiteSpace(txtQ1.Text) || string.IsNullOrWhiteSpace(txtA1.Text) || string.IsNullOrWhiteSpace(txtQ2.Text) || string.IsNullOrWhiteSpace(txtA2.Text))
+                        { MessageBox.Show("密保问题与答案均不能为空", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+                        q1 = txtQ1.Text.Trim(); a1 = txtA1.Text.Trim(); q2 = txtQ2.Text.Trim(); a2 = txtA2.Text.Trim();
+                    }
 
                     SecuritySettings sec = new SecuritySettings
                     {
                         SetupDone = true,
                         Pin = pin,
-                        Question1 = txtQ1.Text.Trim(),
-                        Answer1 = txtA1.Text.Trim(),
-                        Question2 = txtQ2.Text.Trim(),
-                        Answer2 = txtA2.Text.Trim(),
+                        Question1 = q1,
+                        Answer1 = a1,
+                        Question2 = q2,
+                        Answer2 = a2,
                     };
                     SaveSecuritySettings(sec);
                     MessageBox.Show("找回密码信息已保存", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -2067,10 +2117,65 @@ namespace LocalCloud
             }
         }
 
+        /// <summary>修改已设置的密保/PIN 前，先验证现有 PIN 与密保答案</summary>
+        private bool VerifySecurityForEdit(out SecuritySettings sec)
+        {
+            sec = ReadSecuritySettings();
+            if (!sec.SetupDone) return true;   // 尚未设置，无需验证
+            SecuritySettings current = sec;   // 局部变量副本，供 lambda 捕获
+            using (Form frm = new Form()
+            {
+                Text = "验证身份",
+                StartPosition = FormStartPosition.CenterParent,
+                FormBorderStyle = FormBorderStyle.FixedDialog,
+                MaximizeBox = false,
+                MinimizeBox = false,
+                ClientSize = new Size(420, 250)
+            })
+            {
+                int y = 16;
+                frm.Controls.Add(new Label() { Text = "请输入已设置的 PIN 与密保答案以修改设置：", Location = new Point(16, y), AutoSize = true });
+                y += 34;
+                frm.Controls.Add(new Label() { Text = "四位PIN码:", Location = new Point(16, y), AutoSize = true });
+                TextBox txtPin = new TextBox() { Location = new Point(150, y - 3), Width = 120, UseSystemPasswordChar = true, MaxLength = 4 };
+                txtPin.KeyPress += (s, ev) => { if (!char.IsControl(ev.KeyChar) && !char.IsDigit(ev.KeyChar)) ev.Handled = true; };
+                frm.Controls.Add(txtPin);
+                y += 34;
+                frm.Controls.Add(new Label() { Text = "答案1 (" + (sec.Question1.Length > 0 ? sec.Question1 : "未设置") + "):", Location = new Point(16, y), AutoSize = true });
+                TextBox txtA1 = new TextBox() { Location = new Point(150, y - 3), Width = 240 };
+                frm.Controls.Add(txtA1);
+                y += 34;
+                frm.Controls.Add(new Label() { Text = "答案2 (" + (sec.Question2.Length > 0 ? sec.Question2 : "未设置") + "):", Location = new Point(16, y), AutoSize = true });
+                TextBox txtA2 = new TextBox() { Location = new Point(150, y - 3), Width = 240 };
+                frm.Controls.Add(txtA2);
+                y += 44;
+                Button btnOk = new Button() { Text = "确定", Location = new Point(140, y), Width = 100 };
+                Button btnCancel = new Button() { Text = "取消", Location = new Point(250, y), Width = 90 };
+                frm.Controls.Add(btnOk);
+                frm.Controls.Add(btnCancel);
+                btnCancel.Click += (s, ev) => frm.DialogResult = DialogResult.Cancel;
+                btnOk.Click += (s, ev) =>
+                {
+                    if (txtPin.Text.Trim() != current.Pin) { MessageBox.Show("四位 PIN 码错误", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+                    if (!VerifySecurityAnswers(current, txtA1.Text, txtA2.Text)) { MessageBox.Show("密保答案错误", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+                    frm.DialogResult = DialogResult.OK;
+                };
+                return frm.ShowDialog(this) == DialogResult.OK;
+            }
+        }
+
+        /// <summary>带身份验证地打开密保设置表单</summary>
+        private void OpenSecuritySetupForEdit()
+        {
+            SecuritySettings sec;
+            if (!VerifySecurityForEdit(out sec)) return;
+            ShowSecuritySetupForm(false, sec);
+        }
+
         /// <summary>「我的」页：设置 / 修改密保与重置密码</summary>
         private void BtnSecuritySetup_Click(object sender, EventArgs e)
         {
-            ShowSecuritySetupForm(false);
+            OpenSecuritySetupForEdit();
         }
 
 
@@ -2268,7 +2373,7 @@ namespace LocalCloud
         /// 已落盘且之后没有新请求时不重复写文件。
         /// </summary>
         /// <returns>是否实际写入了文件</returns>
-        private bool SaveLogToFile()
+        private bool SaveLogToFile(bool silent = false)
         {
             try
             {
@@ -2292,8 +2397,8 @@ namespace LocalCloud
                 // 已落盘，重置标记，避免同一段日志被重复保存
                 _logHasUnsavedRequests = false;
 
-                // 可选：在界面上短暂提示
-                AutoWindow($"日志已保存到：Log\\{fileName}", 0.5m, "日志保存");
+                // 可选：在界面上短暂提示（每日自动清理时静默，不打扰用户）
+                if (!silent) AutoWindow($"日志已保存到：Log\\{fileName}", 0.5m, "日志保存");
                 //保存日志后清空日志内容，避免重复保存
                 txtLog.Clear();
                 return true;
@@ -2302,6 +2407,26 @@ namespace LocalCloud
             {
                 // 保存失败不影响主流程；此处可能在窗体关闭过程中执行，
                 // 写 UI 日志有可能再次失败，故做静默保护，避免退出时崩溃
+                try { AddLog($"保存日志失败: {ex.Message}"); } catch { }
+                return false;
+            }
+        }
+
+        /// <summary>将指定日志文本保存到 Log 目录（每日自动清理使用）</summary>
+        private bool SaveLogTextToFile(string logContent, bool silent)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(logContent)) return false;
+                string fileName = "Log_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".txt";
+                string logDir = Path.Combine(Application.StartupPath, "Log");
+                if (!Directory.Exists(logDir)) Directory.CreateDirectory(logDir);
+                File.WriteAllText(Path.Combine(logDir, fileName), logContent, Encoding.UTF8);
+                if (!silent) AutoWindow($"日志已保存到：Log\\{fileName}", 0.5m, "日志保存");
+                return true;
+            }
+            catch (Exception ex)
+            {
                 try { AddLog($"保存日志失败: {ex.Message}"); } catch { }
                 return false;
             }
@@ -2412,6 +2537,127 @@ namespace LocalCloud
             _logKeepDays = LogKeepDaysFromIndex(cmbLogKeepDays.SelectedIndex);
             SaveLogKeepConfig();
             CleanupOldLogs();
+        }
+
+        /// <summary>加载每日日志清理配置（时间 / 清理前是否保存）</summary>
+        private void LoadLogDailyConfig()
+        {
+            try
+            {
+                _loadingLogConfig = true;
+                string cfgPath = GetConfigPath(LOG_DAILY_CONFIG_FILE);
+                if (File.Exists(cfgPath))
+                {
+                    foreach (string raw in File.ReadAllLines(cfgPath, Encoding.UTF8))
+                    {
+                        string line = raw.Trim();
+                        int i = line.IndexOf('=');
+                        if (i <= 0) continue;
+                        string key = line.Substring(0, i).Trim();
+                        string val = line.Substring(i + 1).Trim();
+                        if (key == "SaveBeforeClear") _saveLogBeforeAutoClear = val != "0";
+                        else if (key == "CleanupTime")
+                        {
+                            TimeSpan ts;
+                            if (TimeSpan.TryParse(val, out ts)) _logCleanupTime = ts;
+                        }
+                    }
+                }
+                if (dtpLogCleanupTime != null) dtpLogCleanupTime.Value = DateTime.Today.Add(_logCleanupTime);
+                if (chkSaveLogBeforeAutoClear != null) chkSaveLogBeforeAutoClear.Checked = _saveLogBeforeAutoClear;
+                SaveLogDailyConfig();
+            }
+            catch (Exception ex)
+            {
+                AddLog($"加载每日日志配置失败: {ex.Message}");
+            }
+            finally { _loadingLogConfig = false; }
+        }
+
+        /// <summary>保存每日日志清理配置</summary>
+        private void SaveLogDailyConfig()
+        {
+            if (_loadingLogConfig) return;
+            try
+            {
+                string[] lines = new string[]
+                {
+                    "SaveBeforeClear=" + (_saveLogBeforeAutoClear ? "1" : "0"),
+                    "CleanupTime=" + _logCleanupTime.ToString(@"hh\:mm")
+                };
+                File.WriteAllLines(GetConfigPath(LOG_DAILY_CONFIG_FILE), lines, Encoding.UTF8);
+            }
+            catch (Exception ex)
+            {
+                AddLog($"保存每日日志配置失败: {ex.Message}");
+            }
+        }
+
+        /// <summary>每日清理时间 / 保存开关变化</summary>
+        private void LogDailyConfig_Changed(object sender, EventArgs e)
+        {
+            if (_loadingLogConfig) return;
+            if (dtpLogCleanupTime != null) _logCleanupTime = dtpLogCleanupTime.Value.TimeOfDay;
+            if (chkSaveLogBeforeAutoClear != null) _saveLogBeforeAutoClear = chkSaveLogBeforeAutoClear.Checked;
+            SaveLogDailyConfig();
+        }
+
+        /// <summary>启动每日日志清理定时器（每 30 秒检查是否到达设定时间，每天仅执行一次）</summary>
+        private void StartDailyLogTimer()
+        {
+            if (_dailyLogTimer != null) return;
+            _dailyLogTimer = new System.Timers.Timer(30000) { AutoReset = true };
+            _dailyLogTimer.Elapsed += DailyLogTimer_Elapsed;
+            _dailyLogTimer.Start();
+        }
+
+        private void StopDailyLogTimer()
+        {
+            if (_dailyLogTimer == null) return;
+            _dailyLogTimer.Stop();
+            _dailyLogTimer.Dispose();
+            _dailyLogTimer = null;
+        }
+
+        private void DailyLogTimer_Elapsed(object sender, ElapsedEventArgs e)
+        {
+            try
+            {
+                DateTime now = DateTime.Now;
+                if (now.TimeOfDay < _logCleanupTime) return;
+                if (_lastDailyLogDate.Date == now.Date) return;
+                _lastDailyLogDate = now.Date;
+
+                CleanupOldLogs();   // 日志文件按保留天数清理
+
+                // 日志框：在 UI 线程清理，按开关决定是否先保存（仅请求类日志落盘）
+                if (this.InvokeRequired) this.Invoke(new Action(ClearLogBoxDaily));
+                else ClearLogBoxDaily();
+            }
+            catch (Exception ex)
+            {
+                try { AddLog($"每日日志清理失败: {ex.Message}"); } catch { }
+            }
+        }
+
+        private void ClearLogBoxDaily()
+        {
+            try
+            {
+                if (_saveLogBeforeAutoClear)
+                {
+                    // 每日自动清理：勾选了"清理前保存"就保存当前日志框全部内容（不再依赖请求类关键词）
+                    string content = txtLog == null ? "" : txtLog.Text;
+                    if (!string.IsNullOrWhiteSpace(content)) SaveLogTextToFile(content, true);
+                }
+                if (txtLog != null) txtLog.Clear();
+                _logHasUnsavedRequests = false;
+                AddLog("已自动清理日志框");
+            }
+            catch (Exception ex)
+            {
+                AddLog($"自动清理日志框失败: {ex.Message}");
+            }
         }
         /// <summary>
         /// 配置防火墙规则（Windows防火墙）
@@ -7166,6 +7412,9 @@ namespace LocalCloud
 
         private void TrayExitApplication(object sender, EventArgs e)
         {
+            // 停止每日日志清理定时器
+            StopDailyLogTimer();
+
             // 停止外网自动监听调度定时器
             if (ngrokAutoTimer != null)
             {

@@ -22,7 +22,6 @@ venv/
 .pytest_cache/
 
 # ==== 构建产物 ====
-*.exe
 *.dll
 *.pdb
 *.zip
